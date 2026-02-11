@@ -2,188 +2,344 @@
 #include "tcp_server.h"
 #include <string.h>
 
-static void tcp_worker_thread(void *args);
-static void tcp_monitor_thread(void *args);
+#define TCP_SERVER_SEND_REQ_BUF_SIZE    (512)
+#define TCP_SERVER_TIMEOUT_S            (20)
 
-err_t tcp_server_init(struct tcp_server *server, uint16_t port, uint16_t max_conns, 
-                      const struct tcp_server_cbs *cbs)
+static void _internal_connection_free(struct tcp_connection *conn)
 {
-        if(server == NULL) {
-                return ERR_VAL;
+        if(!conn)
+                return;
+        
+        struct tcp_server *server = conn->server;
+        
+        if(conn->pcb) {
+                tcp_arg(conn->pcb, NULL);
+                tcp_recv(conn->pcb, NULL);
+                tcp_sent(conn->pcb, NULL);
+                tcp_err(conn->pcb, NULL);
+                tcp_poll(conn->pcb, NULL, 0);
         }
         
-        memset(server, 0, sizeof(struct tcp_server));
-        server->port = port;
-        server->max_conns = max_conns;
-        server->cbs = cbs;
+        conn->state = 0;
         
-        // 互斥锁用于保护 active_conns 计数
-        server->list_mutex = osMutexNew(NULL);
-        if(server->list_mutex == NULL) {
-                return ERR_MEM;
+        osMutexAcquire(server->server_lock, osWaitForever);
+        
+        struct tcp_connection **pp = &server->conn_list;
+        while(*pp) {
+                if(*pp == conn) {
+                        *pp = conn->next;
+                        break;
+                }
+                pp = &(*pp)->next;
+        }
+        
+        if(server->active_conection > 0) {
+                server->active_conection--;
+        }
+        osMutexRelease(server->server_lock);
+        osMemoryPoolFree(server->conn_pool_id, conn);
+}
+
+static void _lwip_error_cb(void *arg, err_t err)
+{
+        struct tcp_connection *conn = (struct tcp_connection *)arg;
+        if(conn) {
+                if(conn->server->cbs->on_error) {
+                        conn->server->cbs->on_error(conn, err);
+                }
+                conn->pcb = NULL;
+                _internal_connection_free(conn);
+        }
+}
+
+static err_t _lwip_sent_cb(void *arg, struct tcp_pcb *tpcb, uint16_t len)
+{
+        struct tcp_connection *conn = (struct tcp_connection *)arg;
+        if(conn && conn->state == 1) {
+                if(conn->unacked_len >= len) {
+                        conn->unacked_len -= len;
+                }
+                if(conn->server->cbs->on_sent) {
+                        conn->server->cbs->on_sent(conn, len);
+                }
         }
         
         return ERR_OK;
 }
 
-err_t tcp_server_start(struct tcp_server *server)
+static err_t _lwip_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-        osThreadAttr_t attr = {
-                .name = "tcp_listen",
-                .stack_size = 2048,
-                .priority = osPriorityNormal,
-        };
+        struct tcp_connection *conn = (struct tcp_connection *)arg;
+        if(!conn)
+                return ERR_VAL;
         
-        server->server_monitor = osThreadNew(tcp_monitor_thread, server, &attr);
-        return (server->server_monitor != NULL) ? ERR_OK : ERR_MEM;
+        if(p != NULL) {
+                conn->last_active_tick = sys_now();
+                tcp_recved(tpcb, p->tot_len);
+                if(conn->server->cbs->on_data) {
+                        conn->server->cbs->on_data(conn, p);
+                }
+                pbuf_free(p);
+        } else if (err == ERR_OK) {
+                if(conn->server->cbs->on_disconnect) {
+                        conn->server->cbs->on_disconnect(conn);
+                }
+                tcp_arg(tpcb, NULL);
+                tcp_close(tpcb);
+                conn->pcb = NULL;
+                _internal_connection_free(conn);
+        } else {
+                tcp_arg(tpcb, NULL);
+                tcp_close(tpcb);
+                conn->pcb = NULL;
+                _internal_connection_free(conn);
+        }
+        return ERR_OK;
 }
 
-err_t tcp_conn_send(struct tcp_conn *conn, const void *data, size_t len)
+static err_t _lwip_poll_cb(void *arg, struct tcp_pcb *tpcb)
 {
-        if(!conn || !conn->conn ||conn->is_closing)
-                return ERR_CONN;
+        struct tcp_connection *conn = (struct tcp_connection *)arg;
+        if(!conn || !tpcb) {
+                return ERR_OK;
+        }
         
-        return netconn_write(conn->conn, data, len, NETCONN_COPY);
+        uint32_t now = sys_now();
+        const uint32_t TIMEOUT_MS = TCP_SERVER_TIMEOUT_S * 1000;
+        if(now - conn->last_active_tick > TIMEOUT_MS) {
+                if(conn->server->cbs->on_disconnect) {
+                        conn->server->cbs->on_disconnect(conn);
+                }
+                
+                tcp_arg(tpcb, NULL);
+                tcp_close(tpcb);
+                conn->pcb = NULL;
+                _internal_connection_free(conn);
+        }
+        return ERR_OK;
 }
 
-static void tcp_monitor_thread(void *args)
+static err_t _lwip_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
-    struct tcp_server *server = (struct tcp_server *)args;
-    struct netconn *new_conn = NULL;
-
-    // 创建监听 socket
-    server->listen_conn = netconn_new(NETCONN_TCP);
-    netconn_bind(server->listen_conn, IP_ADDR_ANY, server->port);
-    netconn_listen(server->listen_conn);
-
-    // 监听 socket 设置为非阻塞
-    netconn_set_nonblocking(server->listen_conn, 1);
-
-    for (;;) {
-
-        // 非阻塞 accept
-        err_t err = netconn_accept(server->listen_conn, &new_conn);
-
-        if (err == ERR_OK) {
-
-            // 在 accept 之后立即检查连接数
-            osMutexAcquire(server->list_mutex, osWaitForever);
-            bool allow = (server->active_conns < server->max_conns);
-            osMutexRelease(server->list_mutex);
-
-            if (!allow) {
-                // 直接关闭，不创建 worker，不占用 backlog
-                netconn_close(new_conn);
-                netconn_delete(new_conn);
-                continue;
-            }
-
-            // 创建连接上下文
-            struct tcp_conn *conn = mem_malloc(sizeof(struct tcp_conn));
-            if (!conn) {
-                netconn_close(new_conn);
-                netconn_delete(new_conn);
-                continue;
-            }
-
-            memset(conn, 0, sizeof(*conn));
-            conn->conn   = new_conn;
-            conn->server = server;
-            conn->state  = TCP_CONN_STATE_INIT;
-            conn->last_active_tick = sys_now();
-
-            // ? 创建 worker 线程
-            osThreadAttr_t attr = {
-                .stack_size = 2048,
-                .priority   = osPriorityNormal,
-            };
-            conn->thread_id = osThreadNew(tcp_worker_thread, conn, &attr);
-
-            if (conn->thread_id == NULL) {
-                netconn_close(new_conn);
-                netconn_delete(new_conn);
-                mem_free(conn);
-            }
+        struct tcp_server *server = (struct tcp_server *)arg;
+        if(err != ERR_OK || server == NULL) 
+                return ERR_VAL;
+        
+        osMutexAcquire(server->server_lock, osWaitForever);
+        if(server->active_conection >= server->max_connection) {
+                // 拒接连接
+                osMutexRelease(server->server_lock);
+                tcp_abort(newpcb);
+                return ERR_ABRT;
         }
-        else if (err == ERR_WOULDBLOCK) {
-            osDelay(10);
+        
+        struct tcp_connection *conn = osMemoryPoolAlloc(server->conn_pool_id, 0);
+        if(!conn) {
+                // 内存不够
+                osMutexRelease(server->server_lock);
+                return ERR_MEM;
         }
-        else {
-            // 其他错误，稍等再试
-            osDelay(10);
-        }
-    }
-}
-
-
-static void tcp_worker_thread(void *args)
-{
-        struct tcp_conn *conn = (struct tcp_conn *)args;
-        struct tcp_server *server = conn->server;
-        struct netbuf *buf;
-
-        // 先做接入控制
-        osMutexAcquire(server->list_mutex, osWaitForever);
-
-        if (server->active_conns >= server->max_conns) {
-                osMutexRelease(server->list_mutex);
-
-                // 服务器忙，礼貌地拒绝（可选）
-                const char *busy_msg = "Server busy\r\n";
-                netconn_write(conn->conn, busy_msg, strlen(busy_msg), NETCONN_COPY);
-
-                netconn_close(conn->conn);
-                netconn_delete(conn->conn);
-                conn->state = TCP_CONN_STATE_CLOSED;
-                mem_free(conn);
-                osThreadExit();
-        }
-
-        server->active_conns++;
-        conn->state = TCP_CONN_STATE_ACTIVE;
-        osMutexRelease(server->list_mutex);
-
-        // 回调 on_connect
-        if (server->cbs->on_connect) {
+        
+        memset(conn, 0, sizeof(struct tcp_connection));
+        conn->pcb = newpcb;
+        conn->server = server;
+        conn->last_active_tick = sys_now();
+        /// @TODO
+        conn->connection_id = (uint32_t)newpcb;
+        conn->state = 1;
+        server->active_conection++;
+        
+        conn->next = server->conn_list;
+        server->conn_list = conn;
+        
+        osMutexRelease(server->server_lock);
+        
+        // 绑定 LwIP 回调
+        tcp_arg(newpcb, conn);
+        tcp_poll(newpcb, _lwip_poll_cb, 4);
+        tcp_recv(newpcb, _lwip_recv_cb);
+        tcp_sent(newpcb, _lwip_sent_cb);
+        tcp_err(newpcb, _lwip_error_cb);
+        
+        if(server->cbs->on_connect) {
                 server->cbs->on_connect(conn);
         }
+        
+        return ERR_OK;
+}
 
-        netconn_set_recvtimeout(conn->conn, 1000);
-
-        while(!conn->is_closing) {
-                err_t err = netconn_recv(conn->conn, &buf);
-                if(err == ERR_OK) {
-                        conn->last_active_tick = sys_now();
-                        if(server->cbs->on_data) {
-                                server->cbs->on_data(conn, buf);
-                        }
-                        netbuf_delete(buf);
-                } else if (err == ERR_TIMEOUT) {
-                        if(sys_now() - conn->last_active_tick > TCP_SERVER_ACTIVE_TIMEOUT_S * 1000) {
-                                break;
-                        }
-                        continue;
-                } else {
-                        break;
+static void _server_start_internal(void *arg)
+{
+        struct tcp_server *server = (struct tcp_server *)arg;
+        struct tcp_pcb *pcb = tcp_new();
+        
+        if(pcb) {
+                if(tcp_bind(pcb, IP_ADDR_ANY, server->port) == ERR_OK) {
+                        server->listen_pcb = tcp_listen(pcb);
+                        tcp_arg(server->listen_pcb, server);
+                        tcp_accept(server->listen_pcb, _lwip_accept_cb);
                 }
         }
-
-        conn->state = TCP_CONN_STATE_CLOSING;
-
-        if(server->cbs->on_close) {
-                server->cbs->on_close(conn);
-        }
-
-        netconn_close(conn->conn);
-        netconn_delete(conn->conn);
-
-        osMutexAcquire(server->list_mutex, osWaitForever);
-        if (server->active_conns > 0) {
-                server->active_conns--;
-        }
-        osMutexRelease(server->list_mutex);
-
-        conn->state = TCP_CONN_STATE_CLOSED;
-        mem_free(conn);
-        osThreadExit();
+        
 }
+
+struct send_req {
+        uint8_t payload[TCP_SERVER_SEND_REQ_BUF_SIZE];
+        struct tcp_connection *conn;
+        uint16_t len;
+};
+
+int tcp_server_init(struct tcp_server *server, uint16_t port, uint16_t max_conn, const struct tcp_server_cbs *cbs)
+{
+        if(!server || !cbs)
+                return -1;
+        
+        server->port = port;
+        server->max_connection = max_conn;
+        server->active_conection = 0;
+        server->cbs = cbs;
+        server->conn_list = NULL;
+        
+        server->server_lock = osMutexNew(NULL);
+        server->conn_pool_id = osMemoryPoolNew(max_conn, sizeof(struct tcp_connection), NULL);
+        server->req_message_id = osMemoryPoolNew(16, sizeof(struct send_req), NULL); 
+        
+        if(server->server_lock == NULL  || 
+           server->conn_pool_id == NULL || 
+           server->req_message_id == NULL) {
+                return -2;
+        }
+        
+        tcpip_callback(_server_start_internal, server);
+        return 0;
+}
+
+void static _tcp_server_close_executor(void *arg)
+{
+        struct tcp_server *server = (struct tcp_server *)arg;
+        if(!server) 
+                return;
+        
+        if(server->listen_pcb) {
+                tcp_arg(server->listen_pcb, NULL);
+                tcp_accept(server->listen_pcb, NULL);
+                tcp_close(server->listen_pcb);
+                server->listen_pcb = NULL;
+        }
+        
+        struct tcp_connection *conn = server->conn_list;
+        while(conn) {
+                struct tcp_connection *next = conn->next;
+                tcp_server_conn_close(conn);
+                conn = next;
+        }
+        
+        server->conn_list = NULL;
+        server->active_conection = 0;
+}
+
+void tcp_server_close(struct tcp_server *server)
+{
+        if(!server)
+                return;
+        
+        tcpip_callback(_tcp_server_close_executor, server);
+        if(server->server_lock) {
+                osMutexDelete(server->server_lock);
+                server->server_lock = NULL;
+        }
+        
+        if(server->conn_pool_id) {
+                osMemoryPoolDelete(server->conn_pool_id);
+                server->conn_pool_id = NULL;
+        }
+        
+        if(server->req_message_id) {
+                osMemoryPoolDelete(server->req_message_id);
+                server->req_message_id = NULL;
+        }
+}
+
+static void _safe_write_executor(void *arg)
+{
+    struct send_req *req = (struct send_req *)arg;
+    struct tcp_connection *conn = req->conn;
+    
+    if(!conn || conn->state == 0 || conn->pcb == NULL) {
+        osMemoryPoolFree(req->conn->server->req_message_id, req);
+        return;
+    }
+
+    err_t err = tcp_write(conn->pcb, req->payload, req->len, TCP_WRITE_FLAG_COPY);
+    if(err == ERR_OK) {
+        tcp_output(conn->pcb);
+        conn->unacked_len += req->len;
+    }
+
+    osMemoryPoolFree(conn->server->req_message_id, req);
+}
+
+static void _safe_close_executor(void *arg)
+{
+        struct tcp_connection *conn = (struct tcp_connection *)arg;
+        if(!conn || conn->state == 0 || conn->pcb == NULL) {
+                return;
+        }
+        
+        struct tcp_pcb *pcb = conn->pcb;
+        
+        tcp_arg(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_poll(pcb, NULL, 0);
+        
+        tcp_close(pcb);
+        conn->pcb = NULL;
+        
+        _internal_connection_free(conn);
+}
+
+void tcp_server_send(struct tcp_connection *conn, const void *data, uint16_t len)
+{
+        if(!conn || !data || len == 0)
+                return;
+        
+        if(conn->state == 0 || conn->pcb == NULL)
+                return;
+        
+        const uint8_t *pdata = (const uint8_t *)data;
+        uint16_t remaining = len;
+        while(remaining > 0) {
+                uint16_t chunk = (remaining > TCP_SERVER_SEND_REQ_BUF_SIZE) 
+                                            ? TCP_SERVER_SEND_REQ_BUF_SIZE 
+                                            : remaining;
+                struct send_req *req = osMemoryPoolAlloc(conn->server->req_message_id, 0);
+                if(!req) {
+                        // 内存满了
+                        break;
+                }
+                req->conn = conn;
+                req->len = chunk;
+                memcpy(req->payload, pdata, chunk);
+                if(tcpip_callback(_safe_write_executor, req) != ERR_OK) {
+                        osMemoryPoolFree(conn->server->req_message_id, req);
+                        break;
+                }
+                
+                pdata += chunk;
+                remaining -= chunk;
+        }
+}
+
+
+bool tcp_server_conn_is_alive(const struct tcp_connection *conn)
+{
+        return conn->state == 1;
+}
+
+void tcp_server_conn_close(struct tcp_connection *conn)
+{
+        tcpip_callback(_safe_close_executor, conn);
+}
+
